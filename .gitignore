@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# Local venvs (the script's own bootstrap venv lives in ~/.cache, not here)
+.venv/
+venv/
+
+# Extraction / conversion artifacts
+*.ab
+*.zip
+*.png
+extracted/
