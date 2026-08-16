@@ -4,7 +4,7 @@ Imports chat logs from the **vanilla F-Chat 3.0 Android app** (`net.f_list.fchat
 
 `import_vanilla_logs.py` does the whole trip in one run:
 
-1. **Extract** the binary logs off the device with ADB (`run-as` for debuggable builds -> root -> `adb backup`, first that works).
+1. **Extract** the binary logs off the device with ADB (`run-as` for debuggable builds -> root -> `adb backup`, first that works). Store builds (Amazon/Google Play) ship non-debuggable, so `run-as` can't reach them; the script probes the install (`dumpsys package`) and steers to `adb backup`, which still captures logs from older builds - but not a current targetSdk-34 build on Android 12+ without root. Confirm the on-device backup prompt with an empty password.
 2. **Convert** them to the Horizon export format v2 restricted to logs (`../Horizon/docs/export-format.md`) - the vanilla binary record layout is byte-identical to Horizon/Solstice, so this is a binary -> JSON-zip decode.
 3. **Serve** the desktop side of the Horizon Device Sync protocol (`../Solstice/mobile/sync/`) on the LAN and show the QR code; scan it in Solstice via Data Manager -> Device Sync.
 
