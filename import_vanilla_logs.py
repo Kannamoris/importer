@@ -24,9 +24,11 @@ its own logs during the sync (the protocol is two-way), possibly in several
 batches; this script only reports what would have merged and discards the
 upload unless --save-upload is given.
 
-Requires: python3 (3.9+), the `cryptography` package, `adb` on PATH for
-extraction, and `qrcode` (python) or `qrencode` (CLI) for the QR render -
-without either, the sync code is printed for Solstice's "Enter code manually".
+Requires: Python 3.9+ (on Windows run it as `py -3 import_vanilla_logs.py`),
+`adb` for extraction, and `qrcode` (python) or `qrencode` (CLI) for the QR
+render - without either, the sync code is printed for Solstice's "Enter code
+manually". AES-GCM comes from the `cryptography` package when installed, else
+from the OpenSSL that ships with Python itself.
 
 Examples:
   ./import_vanilla_logs.py --account MyAccount
@@ -36,7 +38,7 @@ Examples:
 """
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["cryptography", "qrcode"]
+# dependencies = ["qrcode"]
 # ///
 from __future__ import annotations
 
@@ -112,15 +114,39 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def ensure_python_deps() -> None:
-    """Auto-install missing Python dependencies into a private venv and re-exec
-    there. cryptography is required; the qrcode module only when the qrencode
-    CLI is not around to render the QR instead. System tools (adb, qrencode)
-    cannot be installed this way and keep their own error messages."""
-    missing = []
+def make_output_safe() -> None:
+    """Never let a character name, a phone's name or the QR's block characters
+    crash output. A Windows console is UTF-8 already, but a pipe or redirect (Git
+    Bash, `| more`, a log file) uses the ANSI code page before Python 3.15, and
+    that has no block characters at all."""
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, 'encoding', None) or '').lower().replace('-', '').replace('_', '')
+        if encoding != 'utf8' and hasattr(stream, 'reconfigure'):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            except (ValueError, OSError):
+                pass
+
+
+def venv_python_works(python: str) -> bool:
+    """False for a missing venv, or one whose base Python was since uninstalled or
+    upgraded away (its python then fails to start, on Windows and POSIX alike)."""
     try:
-        import cryptography  # noqa: F401
-    except ImportError:
+        return subprocess.run([python, '-c', 'import sys'], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def ensure_python_deps() -> None:
+    """Auto-install missing Python dependencies into a private venv and rerun the
+    script there. An AES-GCM backend is required, but this Python's own OpenSSL
+    usually provides one, so `cryptography` is only installed when it does not;
+    the qrcode module is wanted only when the qrencode CLI is not around to render
+    the QR instead. System tools (adb, qrencode) cannot be installed this way and
+    keep their own error messages."""
+    missing = []
+    if not available_gcm_backends():
         missing.append('cryptography')
     if shutil.which('qrencode') is None:
         try:
@@ -130,22 +156,40 @@ def ensure_python_deps() -> None:
     if not missing:
         return
     if os.environ.get('VANILLA_IMPORTER_BOOTSTRAPPED'):
-        die(f'still missing {", ".join(missing)} after the automatic install; '
-            f'install manually: pip install {" ".join(missing)}')
+        if 'cryptography' in missing:
+            die(f'still missing {", ".join(missing)} after the automatic install; '
+                f'install manually: pip install {" ".join(missing)}')
+        return                                  # no QR module: the sync code is printed as text instead
     cache = os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache')
     venv_dir = os.path.join(cache, 'vanilla-importer', 'venv')
-    python = os.path.join(venv_dir, 'Scripts' if os.name == 'nt' else 'bin', 'python')
+    python = (os.path.join(venv_dir, 'Scripts', 'python.exe') if os.name == 'nt'
+              else os.path.join(venv_dir, 'bin', 'python'))
     log(f'Missing Python packages: {", ".join(missing)}. Installing into {venv_dir} '
         '(once; --no-bootstrap disables this)...')
     try:
-        if not os.path.exists(python):
+        if not venv_python_works(python):
             import venv
-            venv.EnvBuilder(with_pip=True).create(venv_dir)
-        subprocess.run([python, '-m', 'pip', 'install', '--quiet', *missing], check=True, timeout=300)
+            venv.EnvBuilder(with_pip=True, clear=os.path.isdir(venv_dir)).create(venv_dir)
+        subprocess.run([python, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', *missing],
+                       stdin=subprocess.DEVNULL, check=True, timeout=600)
     except Exception as error:
-        die(f'automatic install failed ({error}); install manually: pip install {" ".join(missing)}')
+        if 'cryptography' in missing:
+            die(f'automatic install failed ({error}); install manually: pip install {" ".join(missing)}')
+        log(f'Could not install qrcode ({error}); the sync code will be printed as text instead.')
+        return
     os.environ['VANILLA_IMPORTER_BOOTSTRAPPED'] = '1'
-    os.execv(python, [python, os.path.abspath(__file__), *sys.argv[1:]])
+    command = [python, os.path.abspath(__file__), *sys.argv[1:]]
+    if os.name != 'nt':
+        os.execv(python, command)
+    # Windows has no real exec: os.execv neither quotes the arguments (a path with a
+    # space splits in two) nor keeps this process alive, so the shell takes the console
+    # back while the new process still prompts in it. Run it as a child and wait.
+    child = subprocess.Popen(command)
+    while True:
+        try:
+            sys.exit(child.wait())
+        except KeyboardInterrupt:
+            pass                                # the child got the same Ctrl+C and winds down itself
 
 
 def die(msg: str) -> 'NoReturn':  # type: ignore[name-defined]
@@ -220,8 +264,32 @@ def read_index_name(idx: bytes) -> Optional[str]:
 # ADB extraction
 # ---------------------------------------------------------------------------
 
+_ADB = 'adb'
+
+
+def find_adb() -> Optional[str]:
+    """adb from PATH, else from an Android SDK in its usual place (Android Studio
+    installs one but does not put it on PATH, notably on Windows)."""
+    found = shutil.which('adb')
+    if found:
+        return found
+    roots = [os.environ.get('ANDROID_HOME'), os.environ.get('ANDROID_SDK_ROOT')]
+    if os.name == 'nt':
+        roots.append(os.path.join(os.environ.get('LOCALAPPDATA') or '', 'Android', 'Sdk'))
+    elif sys.platform == 'darwin':
+        roots.append(os.path.expanduser('~/Library/Android/sdk'))
+    else:
+        roots.append(os.path.expanduser('~/Android/Sdk'))
+    for root in roots:
+        if root:
+            candidate = os.path.join(root, 'platform-tools', 'adb.exe' if os.name == 'nt' else 'adb')
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
 def adb_command(serial: Optional[str], *args: str) -> List[str]:
-    cmd = ['adb']
+    cmd = [_ADB]
     if serial:
         cmd += ['-s', serial]
     return cmd + list(args)
@@ -309,14 +377,48 @@ def describe_app(info: Dict[str, object]) -> str:
     return ', '.join(bits) + '. ' + rec
 
 
+def parse_adb_devices(text: str) -> Dict[str, str]:
+    """serial -> state ('device', 'unauthorized', 'offline', ...) from `adb devices`."""
+    states: Dict[str, str] = {}
+    for line in text.splitlines():
+        fields = line.strip().split('\t')
+        if len(fields) >= 2 and fields[0] and not line.startswith(('List of devices', '*')):
+            states[fields[0]] = fields[1].strip()
+    return states
+
+
 def check_device(serial: Optional[str]) -> Dict[str, object]:
-    if shutil.which('adb') is None:
-        die('adb is not on PATH; install android-tools or use --from-dir/--from-tar/--from-ab')
-    proc = run_adb(serial, 'devices')
-    lines = [l for l in proc.stdout.decode('utf-8', 'replace').splitlines()[1:] if l.strip()]
-    devices = [l.split('\t')[0] for l in lines if '\tdevice' in l]
+    global _ADB
+    adb = find_adb()
+    if adb is None:
+        if os.name == 'nt':
+            die('adb was not found. Download "SDK Platform-Tools for Windows" from '
+                'https://developer.android.com/tools/releases/platform-tools, unzip it, and add that '
+                'folder to PATH (or install Android Studio). Or skip ADB with --from-dir/--from-tar/--from-ab.')
+        die('adb was not found; install android-tools (or the Android SDK Platform-Tools), '
+            'or skip ADB with --from-dir/--from-tar/--from-ab')
+    _ADB = adb
+    # Start the server up front with its output detached: a server spawned by a
+    # captured command can inherit that command's pipes and keep them open.
+    try:
+        subprocess.run(adb_command(None, 'start-server'), stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    except subprocess.TimeoutExpired:
+        pass
+    states = parse_adb_devices(run_adb(serial, 'devices').stdout.decode('utf-8', 'replace'))
+    if serial is not None:
+        states = {s: st for s, st in states.items() if s == serial}
+    devices = [s for s, state in states.items() if state == 'device']
     if not devices:
-        die('no ADB device connected (check USB debugging and `adb devices`)')
+        if 'unauthorized' in states.values():
+            die('the phone has not authorized this computer yet: unlock it, accept the '
+                '"Allow USB debugging?" prompt (tick "Always allow"), then run the importer again')
+        hint = ''
+        if os.name == 'nt':
+            hint = ("; on Windows some phones (Samsung, Xiaomi, ...) also need the manufacturer's USB driver "
+                    "before adb can see them, and Pixels need Google's USB Driver")
+        die('no ADB device connected: plug the phone in by USB, enable Developer options -> USB debugging, '
+            f'and check that `adb devices` lists it{hint}')
     if serial is None and len(devices) > 1:
         die(f'multiple devices connected, pick one with --serial: {", ".join(devices)}')
     proc = run_adb(serial, 'shell', f'pm path {shell_quote(VANILLA_PACKAGE)}')
@@ -876,30 +978,203 @@ def combine_upload_batches(paths: List[str], out_path: str) -> int:
 
 # ---------------------------------------------------------------------------
 # Sync protocol crypto: every non-empty body is IV(12) || ciphertext || tag(16)
+#
+# Two interchangeable AES-256-GCM backends: the `cryptography` package when it
+# is installed, else OpenSSL's libcrypto through ctypes. Every CPython build
+# already carries a libcrypto for its own ssl/hashlib modules (python.org's
+# Windows builds ship it beside them as libcrypto-3*.dll), so the fallback needs
+# no install at all. That matters on Windows on ARM and 32-bit Windows, where
+# current cryptography releases publish no wheels and pip would try to compile.
 # ---------------------------------------------------------------------------
 
-def load_aesgcm():
-    try:
+# Known-answer vector pinning the wire framing (Solstice crypto.test.ts /
+# McGrew-Viega AES-256-GCM test case 15, 60-byte plaintext, no AAD).
+GCM_KAT_KEY = bytes.fromhex('feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308')
+GCM_KAT_IV = bytes.fromhex('cafebabefacedbaddecaf888')
+GCM_KAT_PLAIN = bytes.fromhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72'
+                              '1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39')
+GCM_KAT_SEALED = bytes.fromhex('522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa'
+                               '8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662eb9f796c'
+                               '8d356fc31a8433884b696f4f')
+
+
+class CryptographyGCM:
+    name = 'cryptography'
+
+    def __init__(self):
+        from cryptography.exceptions import InvalidTag
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    except ImportError:
-        die('the "cryptography" package is required (pacman -S python-cryptography / pip install cryptography)')
-    return AESGCM
+        self._aesgcm, self._invalid = AESGCM, InvalidTag
+
+    def seal(self, key: bytes, iv: bytes, plain: bytes) -> bytes:
+        return self._aesgcm(key).encrypt(iv, plain, None)
+
+    def open(self, key: bytes, iv: bytes, sealed: bytes) -> bytes:
+        try:
+            return self._aesgcm(key).decrypt(iv, sealed, None)
+        except self._invalid as error:          # not a ValueError, so callers would miss it
+            raise ValueError('body failed authentication') from error
+
+
+class OpenSSLGCM:
+    """AES-256-GCM through libcrypto's EVP interface (12-byte IV, 16-byte tag, no AAD)."""
+    name = 'OpenSSL'
+    CTRL_GCM_GET_TAG = 0x10
+    CTRL_GCM_SET_TAG = 0x11
+
+    def __init__(self, path: str):
+        import ctypes
+        c = self._c = ctypes
+        lib = self._lib = ctypes.CDLL(path)
+        self.name = f'OpenSSL ({os.path.basename(path)})'
+        lib.EVP_CIPHER_CTX_new.argtypes, lib.EVP_CIPHER_CTX_new.restype = [], c.c_void_p
+        lib.EVP_CIPHER_CTX_free.argtypes, lib.EVP_CIPHER_CTX_free.restype = [c.c_void_p], None
+        lib.EVP_aes_256_gcm.argtypes, lib.EVP_aes_256_gcm.restype = [], c.c_void_p
+        lib.EVP_CIPHER_CTX_ctrl.argtypes = [c.c_void_p, c.c_int, c.c_int, c.c_void_p]
+        lib.EVP_CIPHER_CTX_ctrl.restype = c.c_int
+        for name, argtypes in (
+                ('EVP_EncryptInit_ex', [c.c_void_p, c.c_void_p, c.c_void_p, c.c_char_p, c.c_char_p]),
+                ('EVP_DecryptInit_ex', [c.c_void_p, c.c_void_p, c.c_void_p, c.c_char_p, c.c_char_p]),
+                ('EVP_EncryptUpdate', [c.c_void_p, c.c_void_p, c.POINTER(c.c_int), c.c_char_p, c.c_int]),
+                ('EVP_DecryptUpdate', [c.c_void_p, c.c_void_p, c.POINTER(c.c_int), c.c_char_p, c.c_int]),
+                ('EVP_EncryptFinal_ex', [c.c_void_p, c.c_void_p, c.POINTER(c.c_int)]),
+                ('EVP_DecryptFinal_ex', [c.c_void_p, c.c_void_p, c.POINTER(c.c_int)])):
+            function = getattr(lib, name)
+            function.argtypes, function.restype = argtypes, c.c_int
+
+    def _run(self, encrypt: bool, key: bytes, iv: bytes, data: bytes, tag: bytes = b'') -> bytes:
+        c, lib = self._c, self._lib
+        if len(key) != 32 or len(iv) != SYNC_IV_LENGTH or len(data) >= 0x7fffff00:
+            raise ValueError('bad AES-GCM parameters')
+        ctx = lib.EVP_CIPHER_CTX_new()
+        if not ctx:
+            raise MemoryError('EVP_CIPHER_CTX_new failed')
+        try:
+            init, update, final = ((lib.EVP_EncryptInit_ex, lib.EVP_EncryptUpdate, lib.EVP_EncryptFinal_ex)
+                                   if encrypt else
+                                   (lib.EVP_DecryptInit_ex, lib.EVP_DecryptUpdate, lib.EVP_DecryptFinal_ex))
+            if init(ctx, lib.EVP_aes_256_gcm(), None, key, iv) != 1:   # 12 bytes is GCM's default IV
+                raise ValueError('AES-GCM init failed')
+            out = c.create_string_buffer(len(data) + 16)
+            produced = c.c_int(0)
+            if update(ctx, out, c.byref(produced), data, len(data)) != 1:
+                raise ValueError('AES-GCM update failed')
+            total = produced.value
+            if not encrypt:
+                tag_buffer = c.create_string_buffer(tag, 16)
+                if lib.EVP_CIPHER_CTX_ctrl(ctx, self.CTRL_GCM_SET_TAG, 16, tag_buffer) != 1:
+                    raise ValueError('AES-GCM set tag failed')
+            if final(ctx, c.byref(out, total), c.byref(produced)) != 1:
+                raise ValueError('body failed authentication')
+            total += produced.value
+            result = c.string_at(out, total)
+            if encrypt:
+                tag_buffer = c.create_string_buffer(16)
+                if lib.EVP_CIPHER_CTX_ctrl(ctx, self.CTRL_GCM_GET_TAG, 16, tag_buffer) != 1:
+                    raise ValueError('AES-GCM get tag failed')
+                result += tag_buffer.raw
+            return result
+        finally:
+            lib.EVP_CIPHER_CTX_free(ctx)
+
+    def seal(self, key: bytes, iv: bytes, plain: bytes) -> bytes:
+        return self._run(True, key, iv, plain)
+
+    def open(self, key: bytes, iv: bytes, sealed: bytes) -> bytes:
+        if len(sealed) < SYNC_TAG_LENGTH:
+            raise ValueError('body too short')
+        return self._run(False, key, iv, sealed[:-SYNC_TAG_LENGTH], sealed[-SYNC_TAG_LENGTH:])
+
+
+def libcrypto_candidates() -> List[str]:
+    """Paths of the libcrypto this Python already ships or links, best first."""
+    import glob
+    import _hashlib                             # loads libcrypto into the process
+    found: List[str] = []
+    if sys.platform.startswith('linux'):
+        try:                                    # exactly the one _hashlib linked
+            with open('/proc/self/maps', encoding='utf-8', errors='replace') as maps:
+                for line in maps:
+                    path = line.split()[-1] if line.strip() else ''
+                    if '/libcrypto.so' in path:
+                        found.append(path)
+        except OSError:
+            pass
+    pattern = 'libcrypto*.dll' if os.name == 'nt' else 'libcrypto*.dylib' if sys.platform == 'darwin' else 'libcrypto.so*'
+    # Beside _hashlib (Windows DLLs\, or the root of an embeddable zip), then the install tree.
+    # macOS's own /usr/lib/libcrypto is never tried: loading it aborts the process.
+    for folder in (os.path.dirname(getattr(_hashlib, '__file__', '') or ''), os.path.join(sys.base_prefix, 'DLLs'),
+                   sys.base_prefix, os.path.join(sys.base_prefix, 'lib'), os.path.dirname(sys.executable)):
+        if folder:
+            found += sorted(glob.glob(os.path.join(folder, pattern)), reverse=True)
+    if os.name != 'nt' and sys.platform != 'darwin':
+        import ctypes.util
+        name = ctypes.util.find_library('crypto')
+        if name:
+            found.append(name)
+    return list(dict.fromkeys(found))
+
+
+def gcm_backend_works(backend) -> bool:
+    try:
+        return (backend.seal(GCM_KAT_KEY, GCM_KAT_IV, GCM_KAT_PLAIN) == GCM_KAT_SEALED
+                and backend.open(GCM_KAT_KEY, GCM_KAT_IV, GCM_KAT_SEALED) == GCM_KAT_PLAIN)
+    except (ValueError, OSError, AttributeError):
+        return False
+
+
+def available_gcm_backends() -> List[object]:
+    """Every working backend, preferred first; each must pass the known-answer test.
+    VANILLA_IMPORTER_AES=openssl or =cryptography restricts the choice (for testing)."""
+    wanted = os.environ.get('VANILLA_IMPORTER_AES', '').lower()
+    backends: List[object] = []
+    if wanted in ('', 'cryptography'):
+        try:
+            backend = CryptographyGCM()
+            if gcm_backend_works(backend):
+                backends.append(backend)
+        except ImportError:
+            pass
+    if wanted in ('', 'openssl'):
+        try:
+            candidates = libcrypto_candidates()
+        except ImportError:                     # a Python built without OpenSSL
+            candidates = []
+        for path in candidates:
+            try:
+                backend = OpenSSLGCM(path)
+            except (OSError, AttributeError):   # unloadable, or not an OpenSSL with EVP GCM
+                continue
+            if gcm_backend_works(backend):
+                backends.append(backend)
+                break
+    return backends
+
+
+_GCM_BACKEND = None
+
+
+def gcm() -> object:
+    global _GCM_BACKEND
+    if _GCM_BACKEND is None:
+        backends = available_gcm_backends()
+        if not backends:
+            die('no AES-GCM implementation found: this Python has no usable OpenSSL, so install '
+                'the "cryptography" package (pip install cryptography)')
+        _GCM_BACKEND = backends[0]
+    return _GCM_BACKEND
 
 
 def encrypt_body(key: bytes, plain: bytes) -> bytes:
     iv = secrets.token_bytes(SYNC_IV_LENGTH)
-    return iv + load_aesgcm()(key).encrypt(iv, plain, None)
+    return iv + gcm().seal(key, iv, plain)       # type: ignore[attr-defined]
 
 
 def decrypt_body(key: bytes, data: bytes) -> bytes:
     """Raises ValueError for a short body or one that fails GCM authentication."""
-    from cryptography.exceptions import InvalidTag
     if len(data) < SYNC_IV_LENGTH + SYNC_TAG_LENGTH:
         raise ValueError('body too short')
-    try:
-        return load_aesgcm()(key).decrypt(data[:SYNC_IV_LENGTH], data[SYNC_IV_LENGTH:], None)
-    except InvalidTag as error:                 # not a ValueError, so callers would miss it
-        raise ValueError('body failed authentication') from error
+    return gcm().open(key, data[:SYNC_IV_LENGTH], data[SYNC_IV_LENGTH:])   # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -1338,20 +1613,35 @@ def save_qr_png(text: str, path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def self_test() -> None:
-    aesgcm = load_aesgcm()
-
     # Known-answer vector pinning the wire framing (Solstice crypto.test.ts /
-    # McGrew-Viega AES-256-GCM test case 15, 60-byte plaintext, no AAD).
+    # McGrew-Viega AES-256-GCM test case 15), written out independently of the constants.
     key = bytes.fromhex('feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308')
-    iv = bytes.fromhex('cafebabefacedbaddecaf888')
     plain = bytes.fromhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72'
                           '1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39')
     expected = bytes.fromhex('cafebabefacedbaddecaf888522dc1f099567d07f47f37a32a84427d643a8cdc'
                              'bfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e63'
                              '93ba7a0abcc9f662eb9f796c8d356fc31a8433884b696f4f')
-    assert iv + aesgcm(key).encrypt(iv, plain, None) == expected, 'AES-GCM framing KAT failed'
+    assert (key, plain, expected) == (GCM_KAT_KEY, GCM_KAT_PLAIN, GCM_KAT_IV + GCM_KAT_SEALED)
     assert decrypt_body(key, expected) == plain, 'AES-GCM decrypt KAT failed'
     assert decrypt_body(key, encrypt_body(key, b'')) == b'', 'empty body round trip failed'
+
+    # Every available backend agrees with every other, and all reject tampering.
+    backends = available_gcm_backends()
+    log(f'AES-GCM backends: {", ".join(b.name for b in backends)} (using {gcm().name}).')  # type: ignore
+    for size in (0, 1, 15, 16, 17, 4096, 1_000_003):
+        data, iv = secrets.token_bytes(size), secrets.token_bytes(SYNC_IV_LENGTH)
+        for sealer in backends:
+            sealed = sealer.seal(key, iv, data)  # type: ignore[attr-defined]
+            for opener in backends:
+                assert opener.open(key, iv, sealed) == data, (sealer, opener, size)  # type: ignore
+                for flipped in (0, len(sealed) - 1):
+                    bad = bytearray(sealed)
+                    bad[flipped] ^= 1
+                    try:
+                        opener.open(key, iv, bytes(bad))  # type: ignore[attr-defined]
+                        raise AssertionError(f'{opener} accepted a tampered body')
+                    except ValueError:
+                        pass
 
     # Binary log round trip, including the corrupt-record stop.
     messages = [
@@ -1409,6 +1699,12 @@ def self_test() -> None:
     assert not is_mergeable({**ok, 'time': MAX_TIME + 1})
     assert is_filesystem_artifact('Thumbs.db') and is_filesystem_artifact('.DS_Store')
     assert not is_filesystem_artifact('#abc123') and not is_filesystem_artifact('alice')
+
+    # `adb devices`, including Windows line endings and a server-start banner.
+    assert parse_adb_devices('* daemon started successfully\r\nList of devices attached\r\n'
+                             'R5CT\tunauthorized\r\nemulator-5554\tdevice\r\n0A1B\toffline\r\n\r\n') == {
+        'R5CT': 'unauthorized', 'emulator-5554': 'device', '0A1B': 'offline'}
+    assert parse_adb_devices('List of devices attached\n\n') == {}
 
     self_test_batches()
     self_test_server()
@@ -1748,13 +2044,14 @@ def main() -> None:
     parser.add_argument('--self-test', action='store_true', help='run internal format/crypto tests and exit')
     parser.add_argument('--no-bootstrap', action='store_true',
                         help='never auto-install missing Python packages into ~/.cache/vanilla-importer')
+    make_output_safe()
     args = parser.parse_args()
 
     if not args.no_bootstrap:
         ensure_python_deps()
     if args.self_test:
         return self_test()
-    load_aesgcm()                               # fail early if cryptography is missing
+    gcm()                                       # fail early without an AES-GCM backend
     if not args.dry_run and not args.account:
         if sys.stdin.isatty():
             try:
@@ -1781,8 +2078,16 @@ def main() -> None:
             except ValueError as error:
                 die(str(error))
     else:
-        with tempfile.TemporaryDirectory(prefix='vanilla-import-') as scratch:
+        # Not TemporaryDirectory: on Windows a virus scanner still holding the backup file
+        # would make its cleanup raise after a successful extraction.
+        scratch = tempfile.mkdtemp(prefix='vanilla-import-')
+        try:
             raw = extract_from_device(args.serial, args.method, scratch)
+        except subprocess.TimeoutExpired as error:
+            die(f'adb stopped responding ({" ".join(error.cmd[1:]) if isinstance(error.cmd, list) else error.cmd}); '
+                'unplug and replug the phone, run `adb kill-server`, and try again')
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
     if not raw:
         die('no log files found in the source')
 
@@ -1825,6 +2130,10 @@ def main() -> None:
     log('')
     log(f'  {payload}')
     log('')
+    if os.name == 'nt':
+        log('Windows: the phone connects in to this PC, so if Windows Defender Firewall asks whether Python '
+            'may communicate on networks, allow it - on a network set to Public, tick Public too.')
+        log('')
     log(f'Waiting for the phone (the code expires in {SYNC_SESSION_TIMEOUT // 60} minutes; Ctrl+C to abort)...')
 
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -1852,8 +2161,12 @@ def main() -> None:
     server.discard_uploads()
 
     if reason == 'expired':
+        firewall = ('' if os.name != 'nt' else
+                    ' If Solstice said it could not reach the computer, Windows Firewall is the usual cause: '
+                    'allow Python under Windows Security -> Firewall & network protection -> Allow an app '
+                    'through firewall (for this network type), or set the Wi-Fi network to Private.')
         die(f'no phone connected within {SYNC_SESSION_TIMEOUT // 60} minutes, so the sync code expired. '
-            'Run the importer again for a fresh one.')
+            'Run the importer again for a fresh one.' + firewall)
     if reason == 'timed-out':
         die(f'the phone went quiet for {SYNC_ACTIVE_IDLE_TIMEOUT // 60} minutes mid-sync, so the session ended. '
             'Run the importer again; re-syncing is safe, since nothing gets duplicated.')
