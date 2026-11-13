@@ -3,7 +3,7 @@
 
 Android sandboxes each app's data, so Solstice cannot read the vanilla client's logs directly. This script bridges the gap from a computer with ADB:
 
-  1. Extract  - pulls /data/data/net.f_list.fchat/files/<Character>/logs/* off the device via ADB (run-as for debuggable builds, root, or `adb backup` as a fallback).
+  1. Extract  - pulls /data/data/net.f_list.fchat/files/<Character>/logs/* off the device via ADB (`adb backup`, or root).
   2. Convert  - decodes the binary log files (identical record layout across vanilla Android, Horizon and Solstice) into the Horizon export format v2 zip, restricted to logs (Horizon docs/export-format.md).
   3. Serve    - starts the desktop side of the Horizon Device Sync protocol (Horizon docs/log-sync-protocol.md, the canonical spec; Horizon electron/services/sync/ is the reference server): a single-use LAN HTTP server plus a QR code in the terminal. In Solstice: Data Manager -> Device Sync -> Scan QR code.
 
@@ -268,13 +268,12 @@ def parse_app_info(dumpsys_text: str) -> Dict[str, object]:
     version_name = re.search(r'versionName=(\S+)', dumpsys_text)
     version_code = re.search(r'versionCode=(\d+)', dumpsys_text)
     target_sdk = re.search(r'targetSdk=(\d+)', dumpsys_text)
-    # DEBUGGABLE / ALLOW_BACKUP live inside the flags=[...] / pkgFlags=[...] blocks.
+    # ALLOW_BACKUP lives inside the flags=[...] / pkgFlags=[...] blocks.
     flags = ' '.join(re.findall(r'[Ff]lags=\[([^\]]*)\]', dumpsys_text))
     return {
         'version_name': version_name.group(1) if version_name else None,
         'version_code': int(version_code.group(1)) if version_code else None,
         'target_sdk': int(target_sdk.group(1)) if target_sdk else None,
-        'debuggable': 'DEBUGGABLE' in flags,
         'allow_backup': 'ALLOW_BACKUP' in flags,
         'probed': bool(version_name or version_code),
     }
@@ -304,11 +303,9 @@ def backup_viable(info: Dict[str, object]) -> bool:
 
 def auto_order(info: Dict[str, object]) -> List[str]:
     """Extraction strategies to try, ordered by what the probe found."""
-    if info.get('debuggable'):
-        return ['run-as', 'root', 'backup']         # normal side-loaded tester build
     if backup_viable(info):
-        return ['backup', 'root']                   # stock store build: run-as is hopeless
-    return ['root', 'backup']                        # sandboxed and backup-excluded: root only
+        return ['backup', 'root']                   # every released build so far (targetSdk 27)
+    return ['root', 'backup']                        # backup-excluded: root only
 
 
 def describe_app(info: Dict[str, object]) -> str:
@@ -321,14 +318,8 @@ def describe_app(info: Dict[str, object]) -> str:
     bits = [head]
     if info.get('target_sdk') is not None:
         bits.append(f"targetSdk {info['target_sdk']}")
-    bits.append('debuggable=' + ('yes' if info.get('debuggable') else 'no'))
     bits.append('allowBackup=' + ('yes' if info.get('allow_backup') else 'no'))
-    if info.get('debuggable'):
-        rec = 'run-as extraction is available.'
-    elif backup_viable(info):
-        rec = 'not debuggable -> adb backup is the recommended method.'
-    else:
-        rec = 'not debuggable and adb backup excludes its data -> root is required.'
+    rec = 'adb backup is the extraction method.' if backup_viable(info) else 'adb backup excludes its data -> root is required.'
     return ', '.join(bits) + '. ' + rec
 
 
@@ -385,7 +376,7 @@ def files_from_tar_bytes(data: bytes) -> Optional[RawFiles]:
         tf = tarfile.open(fileobj=io.BytesIO(data), mode='r:*')
     except tarfile.TarError:
         return None
-    # run-as/root produce files/<char>/logs/<f>; adb backup apps/<pkg>/f/<char>/logs/<f>
+    # root produces files/<char>/logs/<f>; adb backup apps/<pkg>/f/<char>/logs/<f>
     pattern = re.compile(r'^(?:\./)?(?:apps/[^/]+/f|files)/([^/]+)/logs/([^/]+)$')
     raw: RawFiles = {}
     with tf:
@@ -399,35 +390,6 @@ def files_from_tar_bytes(data: bytes) -> Optional[RawFiles]:
             if extracted is not None:
                 raw[(match.group(1), match.group(2))] = extracted.read()
     return raw
-
-
-def extract_via_run_as(serial: Optional[str]) -> Optional[RawFiles]:
-    """Debuggable builds only: run-as gives us the app's uid."""
-    probe = run_adb(serial, 'shell', f'run-as {VANILLA_PACKAGE} ls files')
-    noise = (probe.stderr + probe.stdout).decode('utf-8', 'replace').lower()
-    if probe.returncode != 0 or 'not debuggable' in noise or 'unknown package' in noise:
-        return None
-    tar = subprocess.run(adb_command(serial, 'exec-out', f'run-as {VANILLA_PACKAGE} tar cf - files'),
-                         capture_output=True, timeout=600)
-    raw = files_from_tar_bytes(tar.stdout)
-    if raw:
-        return raw
-    # No tar on the device (or it failed): fall back to find + cat per file.
-    listing = run_adb(serial, 'shell', f"run-as {VANILLA_PACKAGE} find files -type f -path '*/logs/*'")
-    if listing.returncode != 0:
-        return None
-    pattern = re.compile(r'^files/([^/]+)/logs/([^/]+)$')
-    raw = {}
-    for line in listing.stdout.decode('utf-8', 'replace').splitlines():
-        match = pattern.match(line.strip())
-        if match is None:
-            continue
-        blob = subprocess.run(
-            adb_command(serial, 'exec-out', f'run-as {VANILLA_PACKAGE} cat {shell_quote(line.strip())}'),
-            capture_output=True, timeout=600)
-        if blob.returncode == 0:
-            raw[(match.group(1), match.group(2))] = blob.stdout
-    return raw or None
 
 
 def extract_via_root(serial: Optional[str]) -> Optional[RawFiles]:
@@ -497,26 +459,22 @@ def extract_via_backup(serial: Optional[str], scratch: str,
 
 def extract_from_device(serial: Optional[str], method: str, scratch: str) -> RawFiles:
     info = check_device(serial)
-    strategies = {'run-as': extract_via_run_as, 'root': extract_via_root,
-                  'backup': lambda s: extract_via_backup(s, scratch, info)}
+    strategies = {'root': extract_via_root, 'backup': lambda s: extract_via_backup(s, scratch, info)}
     order = [method] if method != 'auto' else auto_order(info)
-    if method == 'auto' and not info.get('debuggable') and not backup_viable(info):
-        log('Warning: this build is not debuggable and Android excludes its data from adb backup, so extraction needs root.')
+    if method == 'auto' and not backup_viable(info):
+        log('Warning: Android excludes this build\'s data from adb backup, so extraction needs root.')
     for name in order:
         log(f'Trying extraction via {name}...')
         raw = strategies[name](serial)
         if raw:
             log(f'Extracted {len(raw)} files via {name}.')
             return raw
-        reason = {'run-as': ' (app not debuggable - this is a stock/store build)', 'root': ' (no root?)'}.get(name, '')
-        log(f'  {name} did not work{reason}')
+        log(f'  {name} did not work{" (no root?)" if name == "root" else ""}')
 
     # Nothing worked - give guidance tuned to what the probe found.
-    if not info.get('debuggable') and backup_viable(info):
-        die('could not extract logs. This is a store build (not debuggable), so run-as can\'t reach it, but adb backup should work. Re-run and COMPLETE THE ON-DEVICE PROMPT: unlock the phone, tap "Back up my data", and leave the password blank. If the prompt never appears, this ROM disables adb backup - then you need root, or extract by other means and use --from-dir/--from-tar/--from-ab.')
-    if not info.get('debuggable'):
-        die(f"could not extract logs. This build (targetSdk {info.get('target_sdk')}) is not debuggable and Android excludes its data from adb backup, so without root the sandboxed logs are unreachable. Options: root the device, or extract by other means and use --from-dir/--from-tar/--from-ab. (A debuggable build only helps as a FRESH install - it cannot recover existing logs.)")
-    die('could not extract logs from the device. Options: root the device, complete the on-device adb backup prompt, or extract by other means and use --from-dir/--from-tar/--from-ab.')
+    if backup_viable(info):
+        die('could not extract logs. adb backup should work for this build: re-run and COMPLETE THE ON-DEVICE PROMPT - unlock the phone, tap "Back up my data", and leave the password blank. If the prompt never appears, this ROM disables adb backup - then you need root, or extract by other means and use --from-dir/--from-tar/--from-ab.')
+    die(f"could not extract logs. This build (targetSdk {info.get('target_sdk')}) on Android API {info.get('device_sdk')} has its data excluded from adb backup, so without root the logs are unreachable. Options: root the device, or extract by other means and use --from-dir/--from-tar/--from-ab.")
 
 
 def files_from_dir(root: str) -> RawFiles:
@@ -1608,15 +1566,11 @@ def self_test() -> None:
     assert payload == {'v': 1, 'app': SYNC_APP_ID, 'addrs': ['192.168.1.5'], 'port': 51234,
                        'token': 'ab' * 32, 'key': base64.b64encode(bytes(range(32))).decode(), 'account': 'Acc'}
 
-    # App-info probe parsing (dumpsys package output): a debuggable side-load and a stock build.
-    debuggable = parse_app_info(
-        'Packages:\n  Package [net.f_list.fchat] (abc):\n    versionCode=99 minSdk=21 targetSdk=34\n    versionName=3.0.16-debug\n    flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP DEBUGGABLE ]\n')
-    assert debuggable == {'version_name': '3.0.16-debug', 'version_code': 99, 'target_sdk': 34,
-                          'debuggable': True, 'allow_backup': True, 'probed': True}, debuggable
-    stock = parse_app_info(
-        'Packages:\n  Package [net.f_list.fchat] (def):\n    versionCode=27 minSdk=21 targetSdk=30\n    versionName=3.0.15\n    pkgFlags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]\n')
-    assert stock == {'version_name': '3.0.15', 'version_code': 27, 'target_sdk': 30,
-                     'debuggable': False, 'allow_backup': True, 'probed': True}, stock
+    # App-info probe parsing (dumpsys package output): a build from current source (targetSdk 34) and a store build.
+    modern = parse_app_info('Packages:\n  Package [net.f_list.fchat] (abc):\n    versionCode=28 minSdk=21 targetSdk=34\n    versionName=3.0.16\n    flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]\n')
+    assert modern == {'version_name': '3.0.16', 'version_code': 28, 'target_sdk': 34, 'allow_backup': True, 'probed': True}, modern
+    stock = parse_app_info('Packages:\n  Package [net.f_list.fchat] (def):\n    versionCode=27 minSdk=21 targetSdk=30\n    versionName=3.0.15\n    pkgFlags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]\n')
+    assert stock == {'version_name': '3.0.15', 'version_code': 27, 'target_sdk': 30, 'allow_backup': True, 'probed': True}, stock
     assert parse_app_info('')['probed'] is False, 'empty dumpsys must read as unprobed'
 
     # backup_viable: excluded only when a modern-target app meets a modern device.
@@ -1627,10 +1581,14 @@ def self_test() -> None:
     assert backup_viable({'probed': False, 'allow_backup': False}), 'unknown app must stay optimistic'
 
     # auto_order picks a strategy sequence from those capabilities.
-    assert auto_order({**debuggable, 'device_sdk': 34}) == ['run-as', 'root', 'backup']
+    assert auto_order({**modern, 'device_sdk': 34}) == ['root', 'backup']
     assert auto_order({**stock, 'device_sdk': 34}) == ['backup', 'root']
-    assert auto_order({'probed': True, 'debuggable': False, 'allow_backup': True,
-                       'target_sdk': 34, 'device_sdk': 34}) == ['root', 'backup']
+    assert auto_order({'probed': False}) == ['backup', 'root'], 'an unknown build must still try adb backup first'
+
+    # The released 3.0.16 APK as a Galaxy S22 Ultra on Android 15 reports it: old target, so backup works.
+    released = parse_app_info('  Package [net.f_list.fchat] (ce3c6a6):\n    versionCode=28 minSdk=21 targetSdk=27\n    versionName=3.0.16\n    flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]\n    privateFlags=[ PRIVATE_FLAG_ACTIVITIES_RESIZE_MODE_RESIZEABLE_VIA_SDK_VERSION PRIVATE_FLAG_REQUEST_LEGACY_EXTERNAL_STORAGE PRIVATE_FLAG_ALLOW_NATIVE_HEAP_POINTER_TAGGING ]\n    pkgFlags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]\n')
+    assert released == {'version_name': '3.0.16', 'version_code': 28, 'target_sdk': 27, 'allow_backup': True, 'probed': True}, released
+    assert auto_order({**released, 'device_sdk': 35}) == ['backup', 'root']
 
     log('All self-tests passed.')
 
@@ -1849,14 +1807,14 @@ def self_test_server() -> None:
     try:
         server.check_idle(server.idle_since + SYNC_SESSION_TIMEOUT - 1)
         assert server.state == 'waiting'
-        server.check_idle(server.idle_since + SYNC_SESSION_TIMEOUT)
+        server.check_idle(server.idle_since + SYNC_SESSION_TIMEOUT + 1)
         assert server.end_reason == 'expired'
         server.state, server.end_reason = 'paired', None
         server.busy = True
         server.check_idle(server.idle_since + SYNC_ACTIVE_IDLE_TIMEOUT * 10)
         assert server.state == 'paired', 'idle timer must be suspended during a transfer'
         server.busy = False
-        server.check_idle(server.idle_since + SYNC_ACTIVE_IDLE_TIMEOUT)
+        server.check_idle(server.idle_since + SYNC_ACTIVE_IDLE_TIMEOUT + 1)
         assert server.end_reason == 'timed-out'
     finally:
         server.server_close()
@@ -1888,7 +1846,7 @@ def main() -> None:
         epilog='In Solstice: Data Manager -> Device Sync -> Scan QR code (or Enter code manually).\nBoth devices must be on the same Wi-Fi network.')
     source = parser.add_argument_group('source (default: extract from the device via ADB)')
     source.add_argument('-s', '--serial', help='ADB device serial (when several devices are connected)')
-    source.add_argument('--method', choices=['auto', 'run-as', 'root', 'backup'], default='auto', help='ADB extraction strategy (default: try them in order)')
+    source.add_argument('--method', choices=['auto', 'backup', 'root'], default='auto', help='ADB extraction strategy (default: adb backup, then root; root first when Android excludes the app from backups)')
     source.add_argument('--from-dir', metavar='DIR', help='convert an already-extracted directory instead of ADB')
     source.add_argument('--from-tar', metavar='FILE', help='convert an extracted tar instead of ADB')
     source.add_argument('--from-ab', metavar='FILE', help='convert an existing `adb backup` .ab file instead of ADB')
