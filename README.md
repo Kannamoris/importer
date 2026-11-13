@@ -1,6 +1,6 @@
 # importer
 
-Imports chat logs from the **vanilla F-Chat 3.0 Android app** (`net.f_list.fchat`, `../chat3clientForAndroid`) into **Solstice** (`../Solstice`), which cannot read them itself because Android sandboxes each app's data.
+Imports chat logs from the **vanilla F-Chat 3.0 Android app** (`net.f_list.fchat`) into **Solstice** (`../Solstice`), which cannot read them itself because Android sandboxes each app's data.
 
 `import_vanilla_logs.py` does the whole trip in one run:
 
