@@ -5,7 +5,7 @@ Android sandboxes each app's data, so Solstice cannot read the vanilla client's 
 
   1. Extract  - pulls /data/data/net.f_list.fchat/files/<Character>/logs/* off the device via ADB (`adb backup`, or root).
   2. Convert  - decodes the binary log files (identical record layout across vanilla Android, Horizon and Solstice) into the Horizon export format v2 zip, restricted to logs (Horizon docs/export-format.md).
-  3. Serve    - starts the desktop side of the Horizon Device Sync protocol (Horizon docs/log-sync-protocol.md, the canonical spec; Horizon electron/services/sync/ is the reference server): a single-use LAN HTTP server plus a QR code in the terminal. In Solstice: Data Manager -> Device Sync -> Scan QR code.
+  3. Serve    - starts the desktop side of the Horizon Device Sync protocol (Horizon docs/log-sync-protocol.md, the canonical spec; Horizon electron/services/sync/ is the reference server): a single-use LAN HTTP server plus a QR code in the terminal. In Solstice: tap Device sync on the sign-in screen, then Scan QR code.
 
 The QR payload carries a fresh bearer token and AES-256-GCM session key; every non-empty HTTP body on the wire is `IV(12) || ciphertext || tag(16)`. Logs go to the phone in bounded batches when it asks for them (`GET /v1/logs?cursor=`), or as one archive for a client that predates batching. The phone also uploads its own logs during the sync (the protocol is two-way), possibly in several batches; this script only reports what would have merged and discards the upload unless --save-upload is given.
 
@@ -436,7 +436,7 @@ def backup_empty_reason(info: Optional[Dict[str, object]]) -> str:
 def extract_via_backup(serial: Optional[str], scratch: str,
                        info: Optional[Dict[str, object]] = None) -> Optional[RawFiles]:
     ab_path = os.path.join(scratch, 'vanilla-backup.ab')
-    log('Requesting an app backup. ON THE PHONE NOW: unlock it, tap "Back up my data", and leave the password field EMPTY (a password encrypts the file so the importer cannot read it).')
+    log('Requesting an app backup. ON THE PHONE NOW, within a minute (the prompt times out): unlock it, tap "Back up my data", and leave the password field EMPTY (a password encrypts the file so the importer cannot read it).')
     try:
         subprocess.run(adb_command(serial, 'backup', '-f', ab_path, '-noapk', VANILLA_PACKAGE), timeout=600)
     except subprocess.TimeoutExpired:
@@ -1843,7 +1843,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description='Extract vanilla F-Chat Android logs via ADB, convert them to the Horizon format, and serve them to Solstice through Device Sync (QR code).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='In Solstice: Data Manager -> Device Sync -> Scan QR code (or Enter code manually).\nBoth devices must be on the same Wi-Fi network.')
+        epilog='In Solstice: tap Device sync on the sign-in screen, then Scan QR code (or Enter code manually).\nBoth devices must be on the same Wi-Fi network.')
     source = parser.add_argument_group('source (default: extract from the device via ADB)')
     source.add_argument('-s', '--serial', help='ADB device serial (when several devices are connected)')
     source.add_argument('--method', choices=['auto', 'backup', 'root'], default='auto', help='ADB extraction strategy (default: adb backup, then root; root first when Android excludes the app from backups)')
@@ -1920,7 +1920,7 @@ def main() -> None:
     if args.out and archive is not None:
         with open(args.out, 'wb') as f:
             f.write(archive)
-        log(f'Wrote {args.out} (importable via Horizon\'s Data Manager as well).')
+        log(f'Wrote {args.out} (importable via Horizon\'s Manage Data as well).')
     if args.dry_run:
         return
 
@@ -1932,7 +1932,7 @@ def main() -> None:
 
     log('')
     log(f'Device Sync server listening on port {port} (addresses: {", ".join(addrs)}).')
-    log('On the phone: open Solstice -> Data Manager -> Device Sync -> Scan QR code.')
+    log('On the phone: open Solstice, tap Device sync on the sign-in screen, then Scan QR code.')
     log('')
     if not print_qr(payload):
         log('(No QR renderer found - install python-qrcode or qrencode for a scannable code.)')
