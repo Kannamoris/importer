@@ -1,34 +1,15 @@
 #!/usr/bin/env python3
 """Import chat logs from the vanilla F-Chat 3.0 Android app into Solstice.
 
-Android sandboxes each app's data, so Solstice cannot read the vanilla client's
-logs directly. This script bridges the gap from a computer with ADB:
+Android sandboxes each app's data, so Solstice cannot read the vanilla client's logs directly. This script bridges the gap from a computer with ADB:
 
-  1. Extract  - pulls /data/data/net.f_list.fchat/files/<Character>/logs/* off
-                the device via ADB (run-as for debuggable builds, root, or
-                `adb backup` as a fallback).
-  2. Convert  - decodes the binary log files (identical record layout across
-                vanilla Android, Horizon and Solstice) into the Horizon export
-                format v2 zip, restricted to logs (Horizon docs/export-format.md).
-  3. Serve    - starts the desktop side of the Horizon Device Sync protocol
-                (Horizon docs/log-sync-protocol.md, the canonical spec; Horizon
-                electron/services/sync/ is the reference server): a single-use
-                LAN HTTP server plus a QR code in the terminal.
-                In Solstice: Data Manager -> Device Sync -> Scan QR code.
+  1. Extract  - pulls /data/data/net.f_list.fchat/files/<Character>/logs/* off the device via ADB (run-as for debuggable builds, root, or `adb backup` as a fallback).
+  2. Convert  - decodes the binary log files (identical record layout across vanilla Android, Horizon and Solstice) into the Horizon export format v2 zip, restricted to logs (Horizon docs/export-format.md).
+  3. Serve    - starts the desktop side of the Horizon Device Sync protocol (Horizon docs/log-sync-protocol.md, the canonical spec; Horizon electron/services/sync/ is the reference server): a single-use LAN HTTP server plus a QR code in the terminal. In Solstice: Data Manager -> Device Sync -> Scan QR code.
 
-The QR payload carries a fresh bearer token and AES-256-GCM session key; every
-non-empty HTTP body on the wire is `IV(12) || ciphertext || tag(16)`. Logs go
-to the phone in bounded batches when it asks for them (`GET /v1/logs?cursor=`),
-or as one archive for a client that predates batching. The phone also uploads
-its own logs during the sync (the protocol is two-way), possibly in several
-batches; this script only reports what would have merged and discards the
-upload unless --save-upload is given.
+The QR payload carries a fresh bearer token and AES-256-GCM session key; every non-empty HTTP body on the wire is `IV(12) || ciphertext || tag(16)`. Logs go to the phone in bounded batches when it asks for them (`GET /v1/logs?cursor=`), or as one archive for a client that predates batching. The phone also uploads its own logs during the sync (the protocol is two-way), possibly in several batches; this script only reports what would have merged and discards the upload unless --save-upload is given.
 
-Requires: Python 3.9+ (on Windows run it as `py -3 import_vanilla_logs.py`),
-`adb` for extraction, and `qrcode` (python) or `qrencode` (CLI) for the QR
-render - without either, the sync code is printed for Solstice's "Enter code
-manually". AES-GCM comes from the `cryptography` package when installed, else
-from the OpenSSL that ships with Python itself.
+Requires: Python 3.9+ (on Windows run it as `py -3 import_vanilla_logs.py`), `adb` for extraction, and `qrcode` (python) or `qrencode` (CLI) for the QR render - without either, the sync code is printed for Solstice's "Enter code manually". AES-GCM comes from the `cryptography` package when installed, else from the OpenSSL that ships with Python itself.
 
 Examples:
   ./import_vanilla_logs.py --account MyAccount
@@ -68,16 +49,14 @@ from typing import Dict, List, Optional, Set, Tuple
 
 VANILLA_PACKAGE = 'net.f_list.fchat'
 
-# Fixed identifiers from the sync protocol (Horizon docs/log-sync-protocol.md,
-# electron/services/sync/protocol.ts; Solstice mobile/sync/payload.ts).
+# Fixed identifiers from the sync protocol (Horizon docs/log-sync-protocol.md, electron/services/sync/protocol.ts; Solstice mobile/sync/payload.ts).
 SYNC_APP_ID = 'horizon-log-sync'
 SYNC_PROTOCOL_VERSION = 1
 SYNC_IV_LENGTH = 12
 SYNC_TAG_LENGTH = 16
 SYNC_KEY_LENGTH = 32
 
-# Limits, numerically identical to Horizon's protocol.ts so neither side rejects
-# what the other accepts.
+# Limits, numerically identical to Horizon's protocol.ts so neither side rejects what the other accepts.
 SYNC_MAX_BODY_BYTES = 512 * 1024 * 1024               # any encrypted HTTP body
 SYNC_MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024  # one archive, uncompressed
 SYNC_BATCH_TARGET_BYTES = 16 * 1024 * 1024            # JSON one outgoing batch aims for
@@ -89,16 +68,13 @@ SYNC_SESSION_TIMEOUT = 10 * 60                        # seconds to wait for the 
 SYNC_ACTIVE_IDLE_TIMEOUT = 5 * 60                     # seconds a paired session may sit idle
 SYNC_MAX_AUTH_FAILURES = 5
 
-# The binary store reads times back as a signed Int32, so larger values would
-# not round-trip and every re-sync would re-add them (mobile/sync/logMessage.ts).
-# Tighter than the spec's u32 on purpose: Solstice is the receiver here.
+# The binary store reads times back as a signed Int32, so larger values would not round-trip and every re-sync would re-add them (mobile/sync/logMessage.ts). Tighter than the spec's u32 on purpose: Solstice is the receiver here.
 MAX_TIME = 0x7fffffff
 
 # Highest Conversation.Message.Type (Bcast); the spec supports 0 through 6 only.
 MAX_MESSAGE_TYPE = 6
 
-# Dotfiles and Windows shell litter, screened out of sync archives by both
-# peers (Horizon log-backup.ts / Solstice logMessage.ts isFilesystemArtifact).
+# Dotfiles and Windows shell litter, screened out of sync archives by both peers (Horizon log-backup.ts / Solstice logMessage.ts isFilesystemArtifact).
 FILESYSTEM_ARTIFACT = re.compile(r'^\.|^(thumbs\.db|desktop\.ini)(\.json)?$', re.IGNORECASE)
 
 # filesDir children that are not character directories.
@@ -115,10 +91,7 @@ def log(msg: str) -> None:
 
 
 def make_output_safe() -> None:
-    """Never let a character name, a phone's name or the QR's block characters
-    crash output. A Windows console is UTF-8 already, but a pipe or redirect (Git
-    Bash, `| more`, a log file) uses the ANSI code page before Python 3.15, and
-    that has no block characters at all."""
+    """Never let a character name, a phone's name or the QR's block characters crash output. A Windows console is UTF-8 already, but a pipe or redirect (Git Bash, `| more`, a log file) uses the ANSI code page before Python 3.15, and that has no block characters at all."""
     for stream in (sys.stdout, sys.stderr):
         encoding = (getattr(stream, 'encoding', None) or '').lower().replace('-', '').replace('_', '')
         if encoding != 'utf8' and hasattr(stream, 'reconfigure'):
@@ -129,8 +102,7 @@ def make_output_safe() -> None:
 
 
 def venv_python_works(python: str) -> bool:
-    """False for a missing venv, or one whose base Python was since uninstalled or
-    upgraded away (its python then fails to start, on Windows and POSIX alike)."""
+    """False for a missing venv, or one whose base Python was since uninstalled or upgraded away (its python then fails to start, on Windows and POSIX alike)."""
     try:
         return subprocess.run([python, '-c', 'import sys'], stdin=subprocess.DEVNULL,
                               capture_output=True, timeout=60).returncode == 0
@@ -139,12 +111,7 @@ def venv_python_works(python: str) -> bool:
 
 
 def ensure_python_deps() -> None:
-    """Auto-install missing Python dependencies into a private venv and rerun the
-    script there. An AES-GCM backend is required, but this Python's own OpenSSL
-    usually provides one, so `cryptography` is only installed when it does not;
-    the qrcode module is wanted only when the qrencode CLI is not around to render
-    the QR instead. System tools (adb, qrencode) cannot be installed this way and
-    keep their own error messages."""
+    """Auto-install missing Python dependencies into a private venv and rerun the script there. An AES-GCM backend is required, but this Python's own OpenSSL usually provides one, so `cryptography` is only installed when it does not; the qrcode module is wanted only when the qrencode CLI is not around to render the QR instead. System tools (adb, qrencode) cannot be installed this way and keep their own error messages."""
     missing = []
     if not available_gcm_backends():
         missing.append('cryptography')
@@ -157,15 +124,13 @@ def ensure_python_deps() -> None:
         return
     if os.environ.get('VANILLA_IMPORTER_BOOTSTRAPPED'):
         if 'cryptography' in missing:
-            die(f'still missing {", ".join(missing)} after the automatic install; '
-                f'install manually: pip install {" ".join(missing)}')
+            die(f'still missing {", ".join(missing)} after the automatic install; install manually: pip install {" ".join(missing)}')
         return                                  # no QR module: the sync code is printed as text instead
     cache = os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache')
     venv_dir = os.path.join(cache, 'vanilla-importer', 'venv')
     python = (os.path.join(venv_dir, 'Scripts', 'python.exe') if os.name == 'nt'
               else os.path.join(venv_dir, 'bin', 'python'))
-    log(f'Missing Python packages: {", ".join(missing)}. Installing into {venv_dir} '
-        '(once; --no-bootstrap disables this)...')
+    log(f'Missing Python packages: {", ".join(missing)}. Installing into {venv_dir} (once; --no-bootstrap disables this)...')
     try:
         if not venv_python_works(python):
             import venv
@@ -181,9 +146,7 @@ def ensure_python_deps() -> None:
     command = [python, os.path.abspath(__file__), *sys.argv[1:]]
     if os.name != 'nt':
         os.execv(python, command)
-    # Windows has no real exec: os.execv neither quotes the arguments (a path with a
-    # space splits in two) nor keeps this process alive, so the shell takes the console
-    # back while the new process still prompts in it. Run it as a child and wait.
+    # Windows has no real exec: os.execv neither quotes the arguments (a path with a space splits in two) nor keeps this process alive, so the shell takes the console back while the new process still prompts in it. Run it as a child and wait.
     child = subprocess.Popen(command)
     while True:
         try:
@@ -200,12 +163,9 @@ def die(msg: str) -> 'NoReturn':  # type: ignore[name-defined]
 # ---------------------------------------------------------------------------
 # Binary log format
 #
-# Data file `<key>` is a sequence of little-endian records (vanilla Logs.kt,
-# Solstice NativeLogs.swift, Horizon desktop - all byte-identical):
-#   [u32 time][u8 type][u8 senderLen S][S sender][u16 textLen T][T text]
-#   [u16 total = 8+S+T]
-# Index file `<key>.idx` starts with [u8 nameLen N][N name] (the conversation
-# display name); the day entries that follow are irrelevant here.
+# Data file `<key>` is a sequence of little-endian records (vanilla Logs.kt, Solstice NativeLogs.swift, Horizon desktop - all byte-identical):
+#   [u32 time][u8 type][u8 senderLen S][S sender][u16 textLen T][T text][u16 total = 8+S+T]
+# Index file `<key>.idx` starts with [u8 nameLen N][N name] (the conversation display name); the day entries that follow are irrelevant here.
 # ---------------------------------------------------------------------------
 
 def parse_binary_log(buf: bytes) -> List[Message]:
@@ -268,8 +228,7 @@ _ADB = 'adb'
 
 
 def find_adb() -> Optional[str]:
-    """adb from PATH, else from an Android SDK in its usual place (Android Studio
-    installs one but does not put it on PATH, notably on Windows)."""
+    """adb from PATH, else from an Android SDK in its usual place (Android Studio installs one but does not put it on PATH, notably on Windows)."""
     found = shutil.which('adb')
     if found:
         return found
@@ -305,9 +264,7 @@ def shell_quote(s: str) -> str:
 
 
 def parse_app_info(dumpsys_text: str) -> Dict[str, object]:
-    """Pull the fields we care about out of `adb shell dumpsys package <pkg>`
-    (needs no root). `probed` is False when the text carried no package block, so
-    callers can tell "unknown" apart from a genuine False."""
+    """Pull the fields we care about out of `adb shell dumpsys package <pkg>` (needs no root). `probed` is False when the text carried no package block, so callers can tell "unknown" apart from a genuine False."""
     version_name = re.search(r'versionName=(\S+)', dumpsys_text)
     version_code = re.search(r'versionCode=(\d+)', dumpsys_text)
     target_sdk = re.search(r'targetSdk=(\d+)', dumpsys_text)
@@ -336,9 +293,7 @@ def probe_app(serial: Optional[str]) -> Dict[str, object]:
 
 
 def backup_viable(info: Dict[str, object]) -> bool:
-    """adb backup captures an app's data unless the app targets SDK 31+ AND the
-    device runs Android 12+ (API 31+); it also needs allowBackup. Unknowns are
-    treated optimistically so we still attempt the backup."""
+    """adb backup captures an app's data unless the app targets SDK 31+ AND the device runs Android 12+ (API 31+); it also needs allowBackup. Unknowns are treated optimistically so we still attempt the backup."""
     if info.get('probed') and info.get('allow_backup') is False:
         return False
     target, device = info.get('target_sdk'), info.get('device_sdk')
@@ -392,14 +347,10 @@ def check_device(serial: Optional[str]) -> Dict[str, object]:
     adb = find_adb()
     if adb is None:
         if os.name == 'nt':
-            die('adb was not found. Download "SDK Platform-Tools for Windows" from '
-                'https://developer.android.com/tools/releases/platform-tools, unzip it, and add that '
-                'folder to PATH (or install Android Studio). Or skip ADB with --from-dir/--from-tar/--from-ab.')
-        die('adb was not found; install android-tools (or the Android SDK Platform-Tools), '
-            'or skip ADB with --from-dir/--from-tar/--from-ab')
+            die('adb was not found. Download "SDK Platform-Tools for Windows" from https://developer.android.com/tools/releases/platform-tools, unzip it, and add that folder to PATH (or install Android Studio). Or skip ADB with --from-dir/--from-tar/--from-ab.')
+        die('adb was not found; install android-tools (or the Android SDK Platform-Tools), or skip ADB with --from-dir/--from-tar/--from-ab')
     _ADB = adb
-    # Start the server up front with its output detached: a server spawned by a
-    # captured command can inherit that command's pipes and keep them open.
+    # Start the server up front with its output detached: a server spawned by a captured command can inherit that command's pipes and keep them open.
     try:
         subprocess.run(adb_command(None, 'start-server'), stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
@@ -411,14 +362,11 @@ def check_device(serial: Optional[str]) -> Dict[str, object]:
     devices = [s for s, state in states.items() if state == 'device']
     if not devices:
         if 'unauthorized' in states.values():
-            die('the phone has not authorized this computer yet: unlock it, accept the '
-                '"Allow USB debugging?" prompt (tick "Always allow"), then run the importer again')
+            die('the phone has not authorized this computer yet: unlock it, accept the "Allow USB debugging?" prompt (tick "Always allow"), then run the importer again')
         hint = ''
         if os.name == 'nt':
-            hint = ("; on Windows some phones (Samsung, Xiaomi, ...) also need the manufacturer's USB driver "
-                    "before adb can see them, and Pixels need Google's USB Driver")
-        die('no ADB device connected: plug the phone in by USB, enable Developer options -> USB debugging, '
-            f'and check that `adb devices` lists it{hint}')
+            hint = ("; on Windows some phones (Samsung, Xiaomi, ...) also need the manufacturer's USB driver before adb can see them, and Pixels need Google's USB Driver")
+        die(f'no ADB device connected: plug the phone in by USB, enable Developer options -> USB debugging, and check that `adb devices` lists it{hint}')
     if serial is None and len(devices) > 1:
         die(f'multiple devices connected, pick one with --serial: {", ".join(devices)}')
     proc = run_adb(serial, 'shell', f'pm path {shell_quote(VANILLA_PACKAGE)}')
@@ -519,16 +467,14 @@ def parse_android_backup(data: bytes) -> bytes:
 def backup_empty_reason(info: Optional[Dict[str, object]]) -> str:
     """Why an adb backup came back empty, tuned to what the probe found."""
     if info and info.get('probed') and not backup_viable(info):
-        return (f"(this build targets SDK {info.get('target_sdk')} on Android {info.get('device_sdk')}, "
-                'so Android strips its data from adb backup - root is required).')
+        return (f"(this build targets SDK {info.get('target_sdk')} on Android {info.get('device_sdk')}, so Android strips its data from adb backup - root is required).")
     return '(the on-device prompt was probably cancelled, or this ROM disables adb backup).'
 
 
 def extract_via_backup(serial: Optional[str], scratch: str,
                        info: Optional[Dict[str, object]] = None) -> Optional[RawFiles]:
     ab_path = os.path.join(scratch, 'vanilla-backup.ab')
-    log('Requesting an app backup. ON THE PHONE NOW: unlock it, tap "Back up my data", and leave '
-        'the password field EMPTY (a password encrypts the file so the importer cannot read it).')
+    log('Requesting an app backup. ON THE PHONE NOW: unlock it, tap "Back up my data", and leave the password field EMPTY (a password encrypts the file so the importer cannot read it).')
     try:
         subprocess.run(adb_command(serial, 'backup', '-f', ab_path, '-noapk', VANILLA_PACKAGE), timeout=600)
     except subprocess.TimeoutExpired:
@@ -555,40 +501,26 @@ def extract_from_device(serial: Optional[str], method: str, scratch: str) -> Raw
                   'backup': lambda s: extract_via_backup(s, scratch, info)}
     order = [method] if method != 'auto' else auto_order(info)
     if method == 'auto' and not info.get('debuggable') and not backup_viable(info):
-        log('Warning: this build is not debuggable and Android excludes its data from adb backup, '
-            'so extraction needs root.')
+        log('Warning: this build is not debuggable and Android excludes its data from adb backup, so extraction needs root.')
     for name in order:
         log(f'Trying extraction via {name}...')
         raw = strategies[name](serial)
         if raw:
             log(f'Extracted {len(raw)} files via {name}.')
             return raw
-        log(f'  {name} did not work'
-            + (' (app not debuggable - this is a stock/store build)' if name == 'run-as' else
-               ' (no root?)' if name == 'root' else ''))
+        reason = {'run-as': ' (app not debuggable - this is a stock/store build)', 'root': ' (no root?)'}.get(name, '')
+        log(f'  {name} did not work{reason}')
 
     # Nothing worked - give guidance tuned to what the probe found.
     if not info.get('debuggable') and backup_viable(info):
-        die('could not extract logs.\n'
-            "  This is a store build (not debuggable), so run-as can't reach it, but adb backup\n"
-            '  should work. Re-run and COMPLETE THE ON-DEVICE PROMPT: unlock the phone, tap\n'
-            '  "Back up my data", and leave the password blank. If the prompt never appears, this\n'
-            '  ROM disables adb backup - then you need root, or extract by other means and use\n'
-            '  --from-dir/--from-tar/--from-ab.')
+        die('could not extract logs. This is a store build (not debuggable), so run-as can\'t reach it, but adb backup should work. Re-run and COMPLETE THE ON-DEVICE PROMPT: unlock the phone, tap "Back up my data", and leave the password blank. If the prompt never appears, this ROM disables adb backup - then you need root, or extract by other means and use --from-dir/--from-tar/--from-ab.')
     if not info.get('debuggable'):
-        die('could not extract logs.\n'
-            f"  This build (targetSdk {info.get('target_sdk')}) is not debuggable and Android excludes\n"
-            '  its data from adb backup, so without root the sandboxed logs are unreachable. Options:\n'
-            '  root the device, or extract by other means and use --from-dir/--from-tar/--from-ab.\n'
-            '  (A debuggable build only helps as a FRESH install - it cannot recover existing logs.)')
-    die('could not extract logs from the device.\n'
-        '  Options: root the device, complete the on-device adb backup prompt, or extract by\n'
-        '  other means and use --from-dir/--from-tar/--from-ab.')
+        die(f"could not extract logs. This build (targetSdk {info.get('target_sdk')}) is not debuggable and Android excludes its data from adb backup, so without root the sandboxed logs are unreachable. Options: root the device, or extract by other means and use --from-dir/--from-tar/--from-ab. (A debuggable build only helps as a FRESH install - it cannot recover existing logs.)")
+    die('could not extract logs from the device. Options: root the device, complete the on-device adb backup prompt, or extract by other means and use --from-dir/--from-tar/--from-ab.')
 
 
 def files_from_dir(root: str) -> RawFiles:
-    """Collect logs from an extracted directory (any nesting: it finds
-    .../<Character>/logs/* wherever it sits)."""
+    """Collect logs from an extracted directory (any nesting: it finds .../<Character>/logs/* wherever it sits)."""
     raw: RawFiles = {}
     for dirpath, dirnames, filenames in os.walk(root):
         if os.path.basename(dirpath) != 'logs':
@@ -613,8 +545,7 @@ def dedupe_key(m: Message) -> Tuple[object, ...]:
 
 
 def utf8_size(value: str) -> Optional[int]:
-    """UTF-8 byte length, or None for a string that is not valid Unicode (a lone
-    surrogate, which JSON can carry but UTF-8 cannot encode)."""
+    """UTF-8 byte length, or None for a string that is not valid Unicode (a lone surrogate, which JSON can carry but UTF-8 cannot encode)."""
     try:
         return len(value.encode('utf-8'))
     except UnicodeEncodeError:
@@ -622,9 +553,7 @@ def utf8_size(value: str) -> Optional[int]:
 
 
 def is_mergeable(m: object) -> bool:
-    """The protocol's message bounds (Horizon docs/log-sync-protocol.md): a known
-    type, a sender of at most 255 UTF-8 bytes, sender + text + 8 bytes of record
-    overhead within 65535, valid Unicode. Receivers skip anything else."""
+    """The protocol's message bounds (Horizon docs/log-sync-protocol.md): a known type, a sender of at most 255 UTF-8 bytes, sender + text + 8 bytes of record overhead within 65535, valid Unicode. Receivers skip anything else."""
     if not isinstance(m, dict):
         return False
     time, mtype, sender, text = m.get('time'), m.get('type'), m.get('sender'), m.get('text')
@@ -682,8 +611,7 @@ def build_store(raw: RawFiles, only_characters: Optional[List[str]]) -> Store:
                 'messages': unique
             }
     if skipped_out_of_bounds:
-        log(f'Skipped {skipped_out_of_bounds} out-of-bounds messages (timestamps past 2038, '
-            'unknown message types, oversized records).')
+        log(f'Skipped {skipped_out_of_bounds} out-of-bounds messages (timestamps past 2038, unknown message types, oversized records).')
     return {c: k for c, k in store.items() if k}
 
 
@@ -693,8 +621,7 @@ def record_json(m: Message) -> bytes:
 
 
 def sync_manifest(characters: List[str], expected_files: int) -> str:
-    """A Horizon export manifest restricted to logs (Horizon exporter/manifest.ts).
-    `expected_files` counts the log and logs-names entries, not the manifest."""
+    """A Horizon export manifest restricted to logs (Horizon exporter/manifest.ts). `expected_files` counts the log and logs-names entries, not the manifest."""
     return json.dumps({
         'version': 2,
         'createdAt': datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
@@ -713,9 +640,7 @@ def names_json(names: Dict[str, str]) -> str:
 
 
 def build_sync_archive(store: Store) -> bytes:
-    """The whole log set as one sync zip: the Horizon export format restricted to
-    logs (mirrors Solstice mobile/sync/archive.ts buildSyncArchive). Also what a
-    client that predates batching receives from a cursor-less GET /v1/logs."""
+    """The whole log set as one sync zip: the Horizon export format restricted to logs (mirrors Solstice mobile/sync/archive.ts buildSyncArchive). Also what a client that predates batching receives from a cursor-less GET /v1/logs."""
     entries: List[Tuple[str, bytes]] = []
     included: List[str] = []
     for character in sorted(store):
@@ -744,8 +669,7 @@ def build_sync_archive(store: Store) -> bytes:
 
 
 def archive_uncompressed_bytes(zf: zipfile.ZipFile) -> int:
-    """Total declared uncompressed size, read from the central directory so an
-    oversized archive is refused before any entry is inflated."""
+    """Total declared uncompressed size, read from the central directory so an oversized archive is refused before any entry is inflated."""
     return sum(info.file_size for info in zf.infolist())
 
 
@@ -761,17 +685,9 @@ def conversation_plan(store: Store) -> List[Tuple[str, str]]:
 def build_sync_batch(store: Store, plan: List[Tuple[str, str]], start: BatchPosition, index: int,
                      next_cursor: str, budget: int = SYNC_BATCH_TARGET_BYTES,
                      max_records: int = SYNC_BATCH_MAX_RECORDS) -> Tuple[bytes, Optional[BatchPosition], int]:
-    """One batch of a batched GET /v1/logs (Horizon logs-zip.ts buildLogsBatchZip):
-    the conversations from `start` on, until `budget` bytes of JSON or `max_records`
-    records, cut after the record that crosses the budget. A conversation larger
-    than what is left continues in the next batch under the same entry path; the
-    store is time-sorted, so each slice is an ascending run, and the receiver's
-    union merge reassembles the pieces with no extra machinery.
+    """One batch of a batched GET /v1/logs (Horizon logs-zip.ts buildLogsBatchZip): the conversations from `start` on, until `budget` bytes of JSON or `max_records` records, cut after the record that crosses the budget. A conversation larger than what is left continues in the next batch under the same entry path; the store is time-sorted, so each slice is an ascending run, and the receiver's union merge reassembles the pieces with no extra machinery.
 
-    logs-names.json covers only the conversations this batch carries (receivers
-    take a name when they create a conversation and never revisit it), and the
-    manifest describes this batch alone. Returns the zip, where the next batch
-    resumes (None once this one is `done`), and how many messages it carries."""
+    logs-names.json covers only the conversations this batch carries (receivers take a name when they create a conversation and never revisit it), and the manifest describes this batch alone. Returns the zip, where the next batch resumes (None once this one is `done`), and how many messages it carries."""
     remaining, records_left = budget, max_records
     slices: List[Tuple[str, bytes]] = []
     names: Dict[str, Dict[str, str]] = {}
@@ -830,8 +746,7 @@ def is_safe_segment(segment: str) -> bool:
 
 
 def parse_log_entry_path(entry: str) -> Optional[Tuple[str, str]]:
-    """(character, key) for a safe `characters/<Character>/logs/<key>.json` entry,
-    else None. Keys are lower-cased, as Solstice's merge does."""
+    """(character, key) for a safe `characters/<Character>/logs/<key>.json` entry, else None. Keys are lower-cased, as Solstice's merge does."""
     segments = entry.replace('\\', '/').split('/')
     if (len(segments) != 4 or segments[0] != 'characters' or segments[2] != 'logs'
             or not segments[3].endswith('.json')):
@@ -858,15 +773,9 @@ def read_json_entry(zf: zipfile.ZipFile, member: object) -> object:
 
 
 class UploadTally:
-    """What the phone's uploads would add to the converted store, as the running
-    session total POST /v1/logs reports (Horizon server.ts recordMerge). Nothing is
-    persisted. Conversations are unioned by identity, so one split across batches
-    counts once; only messagesAdded is additive.
+    """What the phone's uploads would add to the converted store, as the running session total POST /v1/logs reports (Horizon server.ts recordMerge). Nothing is persisted. Conversations are unioned by identity, so one split across batches counts once; only messagesAdded is additive.
 
-    Dedupe state is kept only for the conversation currently arriving. The phone
-    sends its log set in one total order, with a split conversation in consecutive
-    batches, so this stays exact while bounding memory to one conversation (the
-    same model as Solstice's SyncMerge)."""
+    Dedupe state is kept only for the conversation currently arriving. The phone sends its log set in one total order, with a split conversation in consecutive batches, so this stays exact while bounding memory to one conversation (the same model as Solstice's SyncMerge)."""
 
     def __init__(self, store: Store):
         self.store = store
@@ -920,11 +829,7 @@ class UploadTally:
 
 
 def combine_upload_batches(paths: List[str], out_path: str) -> int:
-    """Join the phone's upload batches into one logs-only export at `out_path`, so
-    --save-upload yields a single archive (importable like --out) however many
-    batches the phone sent. A conversation split across batches becomes one entry
-    again, its pieces in arrival order; display names keep the first value seen;
-    messages no receiver would accept are dropped. Returns the conversation count."""
+    """Join the phone's upload batches into one logs-only export at `out_path`, so --save-upload yields a single archive (importable like --out) however many batches the phone sent. A conversation split across batches becomes one entry again, its pieces in arrival order; display names keep the first value seen; messages no receiver would accept are dropped. Returns the conversation count."""
     pieces: Dict[str, List[Tuple[str, zipfile.ZipInfo]]] = {}
     characters: List[str] = []
     names: Dict[str, Dict[str, str]] = {}
@@ -979,23 +884,14 @@ def combine_upload_batches(paths: List[str], out_path: str) -> int:
 # ---------------------------------------------------------------------------
 # Sync protocol crypto: every non-empty body is IV(12) || ciphertext || tag(16)
 #
-# Two interchangeable AES-256-GCM backends: the `cryptography` package when it
-# is installed, else OpenSSL's libcrypto through ctypes. Every CPython build
-# already carries a libcrypto for its own ssl/hashlib modules (python.org's
-# Windows builds ship it beside them as libcrypto-3*.dll), so the fallback needs
-# no install at all. That matters on Windows on ARM and 32-bit Windows, where
-# current cryptography releases publish no wheels and pip would try to compile.
+# Two interchangeable AES-256-GCM backends: the `cryptography` package when it is installed, else OpenSSL's libcrypto through ctypes. Every CPython build already carries a libcrypto for its own ssl/hashlib modules (python.org's Windows builds ship it beside them as libcrypto-3*.dll), so the fallback needs no install at all. That matters on Windows on ARM and 32-bit Windows, where current cryptography releases publish no wheels and pip would try to compile.
 # ---------------------------------------------------------------------------
 
-# Known-answer vector pinning the wire framing (Solstice crypto.test.ts /
-# McGrew-Viega AES-256-GCM test case 15, 60-byte plaintext, no AAD).
+# Known-answer vector pinning the wire framing (Solstice crypto.test.ts / McGrew-Viega AES-256-GCM test case 15, 60-byte plaintext, no AAD).
 GCM_KAT_KEY = bytes.fromhex('feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308')
 GCM_KAT_IV = bytes.fromhex('cafebabefacedbaddecaf888')
-GCM_KAT_PLAIN = bytes.fromhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72'
-                              '1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39')
-GCM_KAT_SEALED = bytes.fromhex('522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa'
-                               '8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662eb9f796c'
-                               '8d356fc31a8433884b696f4f')
+GCM_KAT_PLAIN = bytes.fromhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39')
+GCM_KAT_SEALED = bytes.fromhex('522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662eb9f796c8d356fc31a8433884b696f4f')
 
 
 class CryptographyGCM:
@@ -1101,8 +997,7 @@ def libcrypto_candidates() -> List[str]:
         except OSError:
             pass
     pattern = 'libcrypto*.dll' if os.name == 'nt' else 'libcrypto*.dylib' if sys.platform == 'darwin' else 'libcrypto.so*'
-    # Beside _hashlib (Windows DLLs\, or the root of an embeddable zip), then the install tree.
-    # macOS's own /usr/lib/libcrypto is never tried: loading it aborts the process.
+    # Beside _hashlib (Windows DLLs\, or the root of an embeddable zip), then the install tree. macOS's own /usr/lib/libcrypto is never tried: loading it aborts the process.
     for folder in (os.path.dirname(getattr(_hashlib, '__file__', '') or ''), os.path.join(sys.base_prefix, 'DLLs'),
                    sys.base_prefix, os.path.join(sys.base_prefix, 'lib'), os.path.dirname(sys.executable)):
         if folder:
@@ -1124,8 +1019,7 @@ def gcm_backend_works(backend) -> bool:
 
 
 def available_gcm_backends() -> List[object]:
-    """Every working backend, preferred first; each must pass the known-answer test.
-    VANILLA_IMPORTER_AES=openssl or =cryptography restricts the choice (for testing)."""
+    """Every working backend, preferred first; each must pass the known-answer test. VANILLA_IMPORTER_AES=openssl or =cryptography restricts the choice (for testing)."""
     wanted = os.environ.get('VANILLA_IMPORTER_AES', '').lower()
     backends: List[object] = []
     if wanted in ('', 'cryptography'):
@@ -1159,8 +1053,7 @@ def gcm() -> object:
     if _GCM_BACKEND is None:
         backends = available_gcm_backends()
         if not backends:
-            die('no AES-GCM implementation found: this Python has no usable OpenSSL, so install '
-                'the "cryptography" package (pip install cryptography)')
+            die('no AES-GCM implementation found: this Python has no usable OpenSSL, so install the "cryptography" package (pip install cryptography)')
         _GCM_BACKEND = backends[0]
     return _GCM_BACKEND
 
@@ -1182,8 +1075,7 @@ def decrypt_body(key: bytes, data: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 class SyncFailure(Exception):
-    """A protocol error answer: `status` with the encrypted `{"error": code}` body
-    (or, for 401, an empty one: no session proof, no encrypted channel)."""
+    """A protocol error answer: `status` with the encrypted `{"error": code}` body (or, for 401, an empty one: no session proof, no encrypted channel)."""
 
     def __init__(self, status: int, code: str):
         super().__init__(code)
@@ -1192,8 +1084,7 @@ class SyncFailure(Exception):
 
 
 def batch_target_bytes() -> int:
-    """The outgoing batch budget. HORIZON_SYNC_BATCH_BYTES overrides it exactly as
-    it does for Horizon, so a small log set can be split into many batches."""
+    """The outgoing batch budget. HORIZON_SYNC_BATCH_BYTES overrides it exactly as it does for Horizon, so a small log set can be split into many batches."""
     raw = os.environ.get('HORIZON_SYNC_BATCH_BYTES', '')
     return int(raw) if raw.isdigit() and 0 < int(raw) <= SYNC_MAX_BODY_BYTES else SYNC_BATCH_TARGET_BYTES
 
@@ -1201,9 +1092,7 @@ def batch_target_bytes() -> int:
 class SyncServer(ThreadingHTTPServer):
     """The desktop side of one single-use sync session (Horizon server.ts).
 
-    state: waiting -> paired -> ended. `end_reason` says why it ended: finished,
-    expired (no handshake within 10 minutes), timed-out (paired but idle for 5),
-    or too-many-auth-failures (5 bad tokens or undecryptable bodies)."""
+    state: waiting -> paired -> ended. `end_reason` says why it ended: finished, expired (no handshake within 10 minutes), timed-out (paired but idle for 5), or too-many-auth-failures (5 bad tokens or undecryptable bodies)."""
     daemon_threads = True
 
     def __init__(self, bind_port: int, account: str, store: Store, save_upload: Optional[str],
@@ -1223,13 +1112,9 @@ class SyncServer(ThreadingHTTPServer):
         self.busy = False                       # one transfer at a time; others get 409 busy
         self.auth_failures = 0
         self.idle_since = time.monotonic()      # not advanced while a transfer is in flight
-        # Live download cursors, token -> (position, batch index). At most two: the one
-        # that produced the batch just sent, so a failed download can be repeated, and
-        # the one naming the next batch.
+        # Live download cursors, token -> (position, batch index). At most two: the one that produced the batch just sent, so a failed download can be repeated, and the one naming the next batch.
         self.send_cursors: Dict[str, Tuple[BatchPosition, int]] = {}
-        # Set once an upload arrives. The store here never changes, but Horizon's cursors
-        # are file offsets an upload's merge moves, so the spec makes every later cursor
-        # request fail; doing the same keeps a client that interleaves honest.
+        # Set once an upload arrives. The store here never changes, but Horizon's cursors are file offsets an upload's merge moves, so the spec makes every later cursor request fail; doing the same keeps a client that interleaves honest.
         self.cursors_stale = False
         self.batching = False
         self.sent_batches = 0
@@ -1380,8 +1265,7 @@ class SyncHandler(BaseHTTPRequestHandler):
         try:
             return decrypt_body(self.server.key, body)
         except ValueError:
-            # A valid token without the key: counted like an auth failure, so a
-            # token-sniffing attacker is cut off quickly.
+            # A valid token without the key: counted like an auth failure, so a token-sniffing attacker is cut off quickly.
             with self.server.lock:
                 self.server.note_auth_failure()
             raise SyncFailure(400, 'bad-encryption')
@@ -1408,23 +1292,20 @@ class SyncHandler(BaseHTTPRequestHandler):
                 raise SyncFailure(409, 'already-paired')
             server.state = 'paired'
             server.idle_since = time.monotonic()
-        log(f'Phone connected: {hello["deviceName"] or "unknown device"} '
-            f'({hello.get("platform") or "?"}, app {hello.get("appVersion") or "?"})')
+        log(f'Phone connected: {hello["deviceName"] or "unknown device"} ({hello.get("platform") or "?"}, app {hello.get("appVersion") or "?"})')
         self._respond_json(200, {
             'ok': True, 'deviceName': server.device_name,
             'account': server.account, 'protocolVersion': SYNC_PROTOCOL_VERSION
         })
 
     def _send_logs(self, query: str) -> None:
-        """GET /v1/logs: the whole archive, or with `cursor` (the capability signal)
-        one bounded batch whose sync-batch.json names the next."""
+        """GET /v1/logs: the whole archive, or with `cursor` (the capability signal) one bounded batch whose sync-batch.json names the next."""
         server = self.server
         params = urllib.parse.parse_qs(query, keep_blank_values=True)
         cursor = params['cursor'][0] if 'cursor' in params else None
         start: BatchPosition = (0, 0)
         index = 0
-        # Opaque on purpose: the query string is not encrypted, so a readable position
-        # would leak character names and conversation keys.
+        # Opaque on purpose: the query string is not encrypted, so a readable position would leak character names and conversation keys.
         next_cursor = secrets.token_hex(16)
         with server.lock:
             if server.busy:
@@ -1469,8 +1350,7 @@ class SyncHandler(BaseHTTPRequestHandler):
             if cursor is None:
                 log(f'  -> sent the whole converted log archive ({len(plain)} bytes zipped).')
             else:
-                log(f'  -> sent batch {index + 1}{" (last)" if following is None else ""}: '
-                    f'{carried} messages, {len(plain)} bytes zipped.')
+                log(f'  -> sent batch {index + 1}{" (last)" if following is None else ""}: {carried} messages, {len(plain)} bytes zipped.')
         finally:
             with server.lock:
                 server.busy = False
@@ -1506,8 +1386,7 @@ class SyncHandler(BaseHTTPRequestHandler):
                     f.write(upload)
                 server.upload_files.append(path)
             self._respond_json(200, {'ok': True, **stats})
-            log(f'  <- received upload batch {server.tally.batches} ({len(upload)} bytes); so far '
-                f'{stats["messagesAdded"]} messages would be new to this export.')
+            log(f'  <- received upload batch {server.tally.batches} ({len(upload)} bytes); so far {stats["messagesAdded"]} messages would be new to this export.')
         finally:
             with server.lock:
                 server.busy = False
@@ -1613,14 +1492,10 @@ def save_qr_png(text: str, path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def self_test() -> None:
-    # Known-answer vector pinning the wire framing (Solstice crypto.test.ts /
-    # McGrew-Viega AES-256-GCM test case 15), written out independently of the constants.
+    # Known-answer vector pinning the wire framing (Solstice crypto.test.ts / McGrew-Viega AES-256-GCM test case 15), written out independently of the constants.
     key = bytes.fromhex('feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308')
-    plain = bytes.fromhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72'
-                          '1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39')
-    expected = bytes.fromhex('cafebabefacedbaddecaf888522dc1f099567d07f47f37a32a84427d643a8cdc'
-                             'bfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e63'
-                             '93ba7a0abcc9f662eb9f796c8d356fc31a8433884b696f4f')
+    plain = bytes.fromhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39')
+    expected = bytes.fromhex('cafebabefacedbaddecaf888522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662eb9f796c8d356fc31a8433884b696f4f')
     assert (key, plain, expected) == (GCM_KAT_KEY, GCM_KAT_PLAIN, GCM_KAT_IV + GCM_KAT_SEALED)
     assert decrypt_body(key, expected) == plain, 'AES-GCM decrypt KAT failed'
     assert decrypt_body(key, encrypt_body(key, b'')) == b'', 'empty body round trip failed'
@@ -1701,8 +1576,7 @@ def self_test() -> None:
     assert not is_filesystem_artifact('#abc123') and not is_filesystem_artifact('alice')
 
     # `adb devices`, including Windows line endings and a server-start banner.
-    assert parse_adb_devices('* daemon started successfully\r\nList of devices attached\r\n'
-                             'R5CT\tunauthorized\r\nemulator-5554\tdevice\r\n0A1B\toffline\r\n\r\n') == {
+    assert parse_adb_devices('* daemon started successfully\r\nList of devices attached\r\nR5CT\tunauthorized\r\nemulator-5554\tdevice\r\n0A1B\toffline\r\n\r\n') == {
         'R5CT': 'unauthorized', 'emulator-5554': 'device', '0A1B': 'offline'}
     assert parse_adb_devices('List of devices attached\n\n') == {}
 
@@ -1736,15 +1610,11 @@ def self_test() -> None:
 
     # App-info probe parsing (dumpsys package output): a debuggable side-load and a stock build.
     debuggable = parse_app_info(
-        'Packages:\n  Package [net.f_list.fchat] (abc):\n'
-        '    versionCode=99 minSdk=21 targetSdk=34\n    versionName=3.0.16-debug\n'
-        '    flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP DEBUGGABLE ]\n')
+        'Packages:\n  Package [net.f_list.fchat] (abc):\n    versionCode=99 minSdk=21 targetSdk=34\n    versionName=3.0.16-debug\n    flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP DEBUGGABLE ]\n')
     assert debuggable == {'version_name': '3.0.16-debug', 'version_code': 99, 'target_sdk': 34,
                           'debuggable': True, 'allow_backup': True, 'probed': True}, debuggable
     stock = parse_app_info(
-        'Packages:\n  Package [net.f_list.fchat] (def):\n'
-        '    versionCode=27 minSdk=21 targetSdk=30\n    versionName=3.0.15\n'
-        '    pkgFlags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]\n')
+        'Packages:\n  Package [net.f_list.fchat] (def):\n    versionCode=27 minSdk=21 targetSdk=30\n    versionName=3.0.15\n    pkgFlags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]\n')
     assert stock == {'version_name': '3.0.15', 'version_code': 27, 'target_sdk': 30,
                      'debuggable': False, 'allow_backup': True, 'probed': True}, stock
     assert parse_app_info('')['probed'] is False, 'empty dumpsys must read as unprobed'
@@ -1904,8 +1774,7 @@ def self_test_server() -> None:
         envelope, logs, _names, _manifest = open_batch(body)
         assert status == 200 and envelope == {} and len(logs) == 3
 
-        # Batched: follow cursors to `done`. The cursor that produced the batch just sent may be
-        # repeated (a failed download); doing so mints a fresh next cursor, and older ones retire.
+        # Batched: follow cursors to `done`. The cursor that produced the batch just sent may be repeated (a failed download); doing so mints a fresh next cursor, and older ones retire.
         cursor, batches, used = SYNC_CURSOR_START, 0, []
         reassembled: Dict[str, List[Message]] = {}
         while cursor is not None:
@@ -2014,36 +1883,27 @@ def summarize(store: Store) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Extract vanilla F-Chat Android logs via ADB, convert them to the Horizon '
-                    'format, and serve them to Solstice through Device Sync (QR code).',
+        description='Extract vanilla F-Chat Android logs via ADB, convert them to the Horizon format, and serve them to Solstice through Device Sync (QR code).',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='In Solstice: Data Manager -> Device Sync -> Scan QR code (or Enter code manually).\n'
-               'Both devices must be on the same Wi-Fi network.')
+        epilog='In Solstice: Data Manager -> Device Sync -> Scan QR code (or Enter code manually).\nBoth devices must be on the same Wi-Fi network.')
     source = parser.add_argument_group('source (default: extract from the device via ADB)')
     source.add_argument('-s', '--serial', help='ADB device serial (when several devices are connected)')
-    source.add_argument('--method', choices=['auto', 'run-as', 'root', 'backup'], default='auto',
-                        help='ADB extraction strategy (default: try them in order)')
+    source.add_argument('--method', choices=['auto', 'run-as', 'root', 'backup'], default='auto', help='ADB extraction strategy (default: try them in order)')
     source.add_argument('--from-dir', metavar='DIR', help='convert an already-extracted directory instead of ADB')
     source.add_argument('--from-tar', metavar='FILE', help='convert an extracted tar instead of ADB')
     source.add_argument('--from-ab', metavar='FILE', help='convert an existing `adb backup` .ab file instead of ADB')
     convert = parser.add_argument_group('conversion')
-    convert.add_argument('--character', action='append', metavar='NAME',
-                         help='only include this character (repeatable, case-insensitive)')
-    convert.add_argument('--out', metavar='FILE',
-                         help='also write the converted Horizon export zip to this path')
+    convert.add_argument('--character', action='append', metavar='NAME', help='only include this character (repeatable, case-insensitive)')
+    convert.add_argument('--out', metavar='FILE', help='also write the converted Horizon export zip to this path')
     convert.add_argument('--dry-run', action='store_true', help='extract and convert only; do not serve')
     serve = parser.add_argument_group('device sync')
-    serve.add_argument('--account', help='your F-List account name (the login name, not a character); '
-                                         'must match the account signed in on Solstice; prompted if omitted')
+    serve.add_argument('--account', help='your F-List account name (the login name, not a character); must match the account signed in on Solstice; prompted if omitted')
     serve.add_argument('--port', type=int, default=0, help='listen port (default: random)')
-    serve.add_argument('--addr', action='append', metavar='IP',
-                       help='advertise this LAN address in the QR code (repeatable; default: autodetect)')
+    serve.add_argument('--addr', action='append', metavar='IP', help='advertise this LAN address in the QR code (repeatable; default: autodetect)')
     serve.add_argument('--qr-png', metavar='FILE', help='also save the QR code as a PNG')
-    serve.add_argument('--save-upload', metavar='FILE',
-                       help='save the logs Solstice uploads back, joined into one archive (default: discard)')
+    serve.add_argument('--save-upload', metavar='FILE', help='save the logs Solstice uploads back, joined into one archive (default: discard)')
     parser.add_argument('--self-test', action='store_true', help='run internal format/crypto tests and exit')
-    parser.add_argument('--no-bootstrap', action='store_true',
-                        help='never auto-install missing Python packages into ~/.cache/vanilla-importer')
+    parser.add_argument('--no-bootstrap', action='store_true', help='never auto-install missing Python packages into ~/.cache/vanilla-importer')
     make_output_safe()
     args = parser.parse_args()
 
@@ -2078,14 +1938,12 @@ def main() -> None:
             except ValueError as error:
                 die(str(error))
     else:
-        # Not TemporaryDirectory: on Windows a virus scanner still holding the backup file
-        # would make its cleanup raise after a successful extraction.
+        # Not TemporaryDirectory: on Windows a virus scanner still holding the backup file would make its cleanup raise after a successful extraction.
         scratch = tempfile.mkdtemp(prefix='vanilla-import-')
         try:
             raw = extract_from_device(args.serial, args.method, scratch)
         except subprocess.TimeoutExpired as error:
-            die(f'adb stopped responding ({" ".join(error.cmd[1:]) if isinstance(error.cmd, list) else error.cmd}); '
-                'unplug and replug the phone, run `adb kill-server`, and try again')
+            die(f'adb stopped responding ({" ".join(error.cmd[1:]) if isinstance(error.cmd, list) else error.cmd}); unplug and replug the phone, run `adb kill-server`, and try again')
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
     if not raw:
@@ -2096,8 +1954,7 @@ def main() -> None:
     if not store:
         die('no messages survived conversion (empty logs, or --character filtered everything out)')
     summarize(store)
-    # The whole archive is only needed for --out, a dry run, or a phone that predates
-    # batching; a batching phone gets bounded batches built on demand instead.
+    # The whole archive is only needed for --out, a dry run, or a phone that predates batching; a batching phone gets bounded batches built on demand instead.
     archive: Optional[bytes] = None
     if args.out or args.dry_run:
         archive = build_sync_archive(store)
@@ -2131,8 +1988,7 @@ def main() -> None:
     log(f'  {payload}')
     log('')
     if os.name == 'nt':
-        log('Windows: the phone connects in to this PC, so if Windows Defender Firewall asks whether Python '
-            'may communicate on networks, allow it - on a network set to Public, tick Public too.')
+        log('Windows: the phone connects in to this PC, so if Windows Defender Firewall asks whether Python may communicate on networks, allow it - on a network set to Public, tick Public too.')
         log('')
     log(f'Waiting for the phone (the code expires in {SYNC_SESSION_TIMEOUT // 60} minutes; Ctrl+C to abort)...')
 
@@ -2153,26 +2009,19 @@ def main() -> None:
     if args.save_upload and server.upload_files:
         try:
             count = combine_upload_batches(server.upload_files, args.save_upload)
-            log(f'Saved the phone\'s upload ({count} conversations from {len(server.upload_files)} '
-                f'batch(es)) to {args.save_upload}'
-                + ('.' if reason == 'finished' else ' - the session did not finish, so it may be incomplete.'))
+            ending = '.' if reason == 'finished' else ' - the session did not finish, so it may be incomplete.'
+            log(f'Saved the phone\'s upload ({count} conversations from {len(server.upload_files)} batch(es)) to {args.save_upload}{ending}')
         except (OSError, zipfile.BadZipFile) as error:
             log(f'Could not save the phone\'s upload to {args.save_upload}: {error}')
     server.discard_uploads()
 
     if reason == 'expired':
-        firewall = ('' if os.name != 'nt' else
-                    ' If Solstice said it could not reach the computer, Windows Firewall is the usual cause: '
-                    'allow Python under Windows Security -> Firewall & network protection -> Allow an app '
-                    'through firewall (for this network type), or set the Wi-Fi network to Private.')
-        die(f'no phone connected within {SYNC_SESSION_TIMEOUT // 60} minutes, so the sync code expired. '
-            'Run the importer again for a fresh one.' + firewall)
+        firewall = ' If Solstice said it could not reach the computer, Windows Firewall is the usual cause: allow Python under Windows Security -> Firewall & network protection -> Allow an app through firewall (for this network type), or set the Wi-Fi network to Private.' if os.name == 'nt' else ''
+        die(f'no phone connected within {SYNC_SESSION_TIMEOUT // 60} minutes, so the sync code expired. Run the importer again for a fresh one.' + firewall)
     if reason == 'timed-out':
-        die(f'the phone went quiet for {SYNC_ACTIVE_IDLE_TIMEOUT // 60} minutes mid-sync, so the session ended. '
-            'Run the importer again; re-syncing is safe, since nothing gets duplicated.')
+        die(f'the phone went quiet for {SYNC_ACTIVE_IDLE_TIMEOUT // 60} minutes mid-sync, so the session ended. Run the importer again; re-syncing is safe, since nothing gets duplicated.')
     if reason == 'too-many-auth-failures':
-        die(f'{SYNC_MAX_AUTH_FAILURES} requests failed authentication, so the session was closed for safety. '
-            'Run the importer again for a fresh code, ideally on a trusted network.')
+        die(f'{SYNC_MAX_AUTH_FAILURES} requests failed authentication, so the session was closed for safety. Run the importer again for a fresh code, ideally on a trusted network.')
 
     if server.batching:
         log(f'Sent {server.sent_messages} messages to the phone in {server.sent_batches} batch(es).')
